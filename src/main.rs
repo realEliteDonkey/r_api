@@ -1,3 +1,6 @@
+mod handlers;
+
+use crate::handlers::*;
 use axum_extra::extract::cookie::Key;
 use std::net::*;
 use axum::{
@@ -73,6 +76,4 @@ async fn main() {
     axum::serve(listener, app).await.expect("> could not serve app with listener.");
 }
 
-async fn landing_handler() -> impl IntoResponse {
-    "Login Handler Called"
-}
+
