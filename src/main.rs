@@ -1,79 +1,63 @@
+mod app_state;
 mod handlers;
+mod server_startup_utils;
+mod shutdown;
 
-use crate::handlers::*;
-use axum_extra::extract::cookie::Key;
-use std::net::*;
+use crate::app_state::AppState;
+use crate::server_startup_utils::*;
+use crate::shutdown::shutdown_sig;
+
 use axum::{
-    routing::{get, post},
-    middleware,
     Router,
-};
-use sqlx::{ postgres::{PgPoolOptions, Postgres,}, pool::Pool };
-use std::env;
-use std::path::Path;
-use axum_extra::extract::cookie::SignedCookieJar;
-use axum::{
     extract::Request,
-    response::{IntoResponse, Redirect, Response, Html},
+    http::StatusCode,
+    middleware,
+    response::{Html, IntoResponse, Redirect, Response},
+    routing::{get, post},
 };
+use axum_extra::extract::cookie::{Key, SignedCookieJar};
 use dotenv::dotenv;
-
-#[derive(Clone)]
-struct AppState {
-    db: Pool<Postgres>,
-}
-
-impl AppState {
-    fn from(pool: Pool<Postgres>) -> Self {
-        Self { db: pool }
-    }
-}
+use sqlx::{
+    pool::Pool,
+    postgres::{PgPoolOptions, Postgres},
+};
+use std::{env, net::*, path::Path};
+use tower_http::services::ServeDir;
 
 #[tokio::main]
-async fn main() {
-
+async fn main() -> tokio::io::Result<()> {
     dotenv().ok();
-    let db_url= env::var("DATABASE_URL").expect("DATABASE_URL not found");
 
-    let pool = match PgPoolOptions::new()
-        .max_connections(3)
-        .connect(&db_url)
-        .await {
-            Ok(pool) => {
-                println!("> created db connection pool.");
-                pool
-            },
-            Err(e) => {
-                eprintln!("Could not connect to database. -> {}", e);
-                return
-            },
-        };
-    
+    let args: Vec<String> = std::env::args().collect();
+
+    let host_ip = get_host_ip(args)
+        .map_err(|status| std::io::Error::new(std::io::ErrorKind::Other, status.to_string()))?;
+
+    let db_url = env::var("DATABASE_URL").expect("DATABASE_URL not found");
+    let pool = gen_connection_pool(db_url)
+        .await
+        .map_err(|status| std::io::Error::new(std::io::ErrorKind::NotFound, status.to_string()))?;
+
     let state = AppState::from(pool);
 
-    let app = Router::new()
-        .route("/", get(landing_handler))
-        .with_state(state);
+    let app_task = tokio::task::spawn_blocking(move || generate_router(state));
 
-    let port = env::var("PORT")
-        .unwrap_or_else(|_| "8080".to_string())
-        .parse::<u16>()
-        .expect("PORT must be a valid numer.");
+    let port_task = tokio::task::spawn_blocking(move || get_env_port());
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let (app, port) = tokio::join!(app_task, port_task);
 
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(listener) => {
-            println!("> server running @ {}", {addr});
-            listener
-        },
-        Err(e) => {
-            eprintln!("> error binding TCP listener | {}", e);
-            return;
-        },
-    };
+    let app = app?;
+    let port = port?;
+    let addr = SocketAddr::from((host_ip, port));
 
-    axum::serve(listener, app).await.expect("> could not serve app with listener.");
+    let listener = gen_tcp_listener(addr)
+        .await
+        .map_err(|status| std::io::Error::new(std::io::ErrorKind::Other, status.to_string()))?;
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_sig())
+        .await
+        .expect("> could not serve app with listener.");
+
+    Ok(())
 }
-
-
